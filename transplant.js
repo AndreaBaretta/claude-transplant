@@ -25,7 +25,7 @@ const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
-const LINUX = process.platform === 'linux'
+const LINUX = (process.env.CLAUDE_TRANSPLANT_PLATFORM || process.platform) === 'linux'
 const desktopExecutable = (file) => typeof file === 'string' && (file.endsWith('/Claude.app/Contents/MacOS/Claude') || LINUX && /\/claude-desktop\/claude-desktop$/.test(file))
 const appBinary = (app) => LINUX ? path.join(app, 'claude-desktop') : appBinary(app)
 const SHUTDOWN_WAIT = 30_000
