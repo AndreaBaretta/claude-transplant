@@ -1212,16 +1212,10 @@ final class Model: ObservableObject {
         }
     }
 
+    // Update checks are disabled: the menubar makes no network requests besides claude.ai
+    // (through the CLI's --cloud path). With no version reported, Update is never offered.
     private func latest(_ done: @escaping (String?) -> Void) {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 10
-        configuration.httpAdditionalHeaders = ["User-Agent": "claude-transplant", "Accept-Language": "en"]
-        let session = URLSession(configuration: configuration)
-        session.dataTask(with: URL(string: "https://registry.npmjs.org/claude-transplant/latest")!) { data, _, _ in
-            let version = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["version"] as? String
-            DispatchQueue.main.async { done(version) }
-        }.resume()
-        session.finishTasksAndInvalidate()
+        DispatchQueue.main.async { done(nil) }
     }
 }
 

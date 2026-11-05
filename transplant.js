@@ -2,7 +2,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
-import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
+import { constants, createReadStream, readFileSync, readdirSync, readlinkSync, realpathSync } from 'node:fs'
 import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile as readBytes, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,7 +25,9 @@ const SCHEDULER_OWNS = 'Desktop scheduler requires an approved restart'
 const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
-const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
+const LINUX = process.platform === 'linux'
+const desktopExecutable = (file) => typeof file === 'string' && (file.endsWith('/Claude.app/Contents/MacOS/Claude') || LINUX && /\/claude-desktop\/claude-desktop$/.test(file))
+const appBinary = (app) => LINUX ? path.join(app, 'claude-desktop') : appBinary(app)
 const SHUTDOWN_WAIT = 30_000
 const REOPEN_RESERVE = 8_000
 const STALL_WAIT = 60_000
@@ -233,7 +235,7 @@ const milliseconds = (value) => {
 const typed = (e) => e && typeof e === 'object' && TYPES.has(e.type) && typeof e.uuid === 'string' && !e.isSidechain
 const message = (e) => typed(e) && e.type !== 'progress'
 
-export function parseProcesses(processes, commands, app = '/Applications/Claude.app', registrations = []) {
+export function parseProcesses(processes, commands, app = '/Applications/Claude.app', registrations = [], starts = new Map()) {
   const pattern = /^\s*(\d+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d{4})\s+(.+)$/
   const identities = new Map(commands.split('\n').filter((line) => line.trim()).map((line) => {
     const match = line.match(pattern)
@@ -245,12 +247,13 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
     if (!match) throw new Error('cannot parse worker process identity')
     const executable = match[4].trim()
     return { pid: Number(match[1]), ppid: Number(match[2]), started: match[3], executable,
-      worker: path.basename(executable).toLowerCase() === 'claude' || executable.endsWith('/Claude.app/Contents/Helpers/disclaimer') || executable === path.join(app, 'Contents/Helpers/disclaimer'),
+      worker: path.basename(executable).toLowerCase() === 'claude' || executable.endsWith('/Claude.app/Contents/Helpers/disclaimer') || executable.endsWith('/claude-desktop/resources/disclaimer') || executable === path.join(app, 'Contents/Helpers/disclaimer'),
       ids: identities.get(`${match[1]}/${match[3]}`) ?? [] }
   })
   for (const row of rows) {
-    const registered = registrations.find(item => item.pid === row.pid && item.pidDomain === 'darwin' &&
-      Number.isFinite(Date.parse(row.started)) && Date.parse(`${item.procStart} UTC`) === Date.parse(row.started) && UUID.test(item.sessionId ?? ''))
+    const registered = registrations.find(item => item.pid === row.pid && UUID.test(item.sessionId ?? '') && (item.pidDomain === 'darwin' &&
+      Number.isFinite(Date.parse(row.started)) && Date.parse(`${item.procStart} UTC`) === Date.parse(row.started) ||
+      typeof item.pidDomain === 'string' && item.pidDomain.startsWith('linux:') && starts.has(row.pid) && starts.get(row.pid) === String(item.procStart)))
     if (registered && row.worker) {
       row.ids = [...new Set([...row.ids, registered.sessionId.toLowerCase()])]
       row.cwd = typeof registered.cwd === 'string' ? registered.cwd : null
@@ -264,7 +267,7 @@ export function parseProcesses(processes, commands, app = '/Applications/Claude.
     row.desktopPid = null
     while (parent && !visited.has(parent.pid)) {
       visited.add(parent.pid)
-      if (desktopExecutable(parent.executable) || parent.executable === path.join(app, 'Contents/MacOS/Claude')) { row.desktopPid = parent.pid; break }
+      if (desktopExecutable(parent.executable) || parent.executable === appBinary(app)) { row.desktopPid = parent.pid; break }
       parent = byPid.get(parent.ppid)
     }
   }
@@ -276,6 +279,8 @@ const processTable = (app) => {
   const processes = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], options)
   const commands = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,command='], options)
   if ([processes, commands].some((result) => result.error || result.status !== 0)) throw new Error('cannot inspect running workers')
+  const starts = new Map()
+  if (LINUX) processes.stdout = linuxExecutables(processes.stdout, starts)
   const directory = path.join(os.homedir(), '.claude/sessions')
   let registrations = []
   try {
@@ -286,7 +291,29 @@ const processTable = (app) => {
       } catch { return [] }
     })
   } catch {}
-  return parseProcesses(processes.stdout, commands.stdout, app, registrations)
+  return parseProcesses(processes.stdout, commands.stdout, app, registrations, starts)
+}
+
+// On Linux `ps -o comm=` is a truncated name, not a path. Swap in /proc/<pid>/exe, mark Electron
+// child processes (they share the main binary but carry --type=) as helpers, and collect each
+// process's start time in clock ticks, which Claude Code records as procStart in ~/.claude/sessions.
+function linuxExecutables(text, starts = new Map()) {
+  const pattern = /^(\s*(\d+)\s+\d+\s+\w{3}\s+\w{3}\s+\d+\s+\d+:\d+:\d+\s+\d{4}\s+)(.+)$/
+  return text.split('\n').map(line => {
+    const match = line.match(pattern)
+    if (!match) return line
+    const pid = match[2]
+    let exe = match[3]
+    try { exe = readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '') } catch {}
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      starts.set(Number(pid), stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19])
+    } catch {}
+    if (desktopExecutable(exe)) {
+      try { if (readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').some(arg => arg.startsWith('--type='))) exe = `${exe} (helper)` } catch {}
+    }
+    return match[1] + exe
+  }).join('\n')
 }
 const workers = (rows = processTable()) => Object.assign(new Set(rows.filter((row) => row.worker && row.pid !== row.desktopPid).flatMap((row) => row.ids)), { rows })
 const ownsWorker = (live, id, recordId) => Boolean(live?.has(id?.toLowerCase()) || live?.has(recordId?.replace(/^local_/, '').toLowerCase()))
@@ -324,7 +351,7 @@ const canRestartWaiting = (receipt, table) => waitingSessions(receipt).some(row 
 })
 
 export async function restartPlan(inv, paths, table = processTable(paths.claudeApp)) {
-  const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const apps = table.filter((row) => desktopExecutable(row.executable) || row.executable === appBinary(paths.claudeApp))
   if (apps.length !== 1) return null
   const desktop = apps[0]
   const all = await accounts(paths)
@@ -398,7 +425,7 @@ const waitFor = async (predicate, deadline, now = () => performance.now(), wait 
     await wait(Math.min(250, deadline - now()))
   } while (true)
 }
-const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+const appProcess = (paths, table = processTable(paths.claudeApp)) => table.find((row) => row.executable === appBinary(paths.claudeApp))
 const command = (file, args, timeout) => new Promise((resolve) => {
   if (timeout <= 0) return resolve({ status: null, timedOut: true })
   const child = spawn(file, args, { stdio: 'ignore' })
@@ -496,7 +523,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const check = (force = false) => {
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
     if (!force && now() < nextInspection) return
-    const possible = io.inspect || spawnSync('/usr/bin/pgrep', ['-x', 'Claude'], { stdio: 'ignore' }).status !== 1
+    const possible = io.inspect || spawnSync(LINUX ? 'pgrep' : '/usr/bin/pgrep', ['-x', LINUX ? 'claude-desktop' : 'Claude'], { stdio: 'ignore' }).status !== 1
     if (possible && appProcess(paths, inspect())) throw Object.assign(new Error('Claude Desktop reopened before the held move finished. Retry the move.'), { code: 'RESTART_REOPENED' })
     nextInspection = now() + 100
     if (now() - lastProgress >= (io.stallWait ?? STALL_WAIT)) throw Object.assign(new Error('The move stopped making progress'), { code: 'MOVE_STALLED' })
@@ -512,7 +539,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
     const shutdownDeadline = now() + shutdownWait
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
+    const quit = await run(...quitCommand(paths, desktop), Math.max(0, shutdownDeadline - now()))
     const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
@@ -537,7 +564,7 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
       state.outcome = 'reopening'
       const reopenDeadline = now() + reserve
       const remaining = reopenDeadline - now()
-      const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1, remaining)))()
+      const opening = (async () => run(...openCommand(paths), Math.max(1, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
       const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
@@ -572,7 +599,28 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   return { result, restart: state, code: stopCode, error: failure?.message ?? state.error, ok: state.outcome === 'reopened' && !state.error && result?.ok !== false }
 }
 
+const quitCommand = (paths, desktop) => LINUX ? ['/bin/kill', ['-TERM', String(desktop.pid)]]
+  : ['/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`]]
+const openCommand = (paths) => LINUX ? ['setsid', ['-f', appBinary(paths.claudeApp)]] : ['/usr/bin/open', ['-g', '-a', paths.claudeApp]]
+
 export function layout(home = os.homedir()) {
+  if (LINUX) {
+    const config = process.env.XDG_CONFIG_HOME || path.join(home, '.config')
+    return {
+      home,
+      records: path.join(config, 'Claude/claude-code-sessions'),
+      agentSessions: path.join(config, 'Claude/local-agent-mode-sessions'),
+      desktop: path.join(config, 'Claude/config.json'),
+      logs: path.join(config, 'Claude/logs'),
+      cookies: path.join(config, 'Claude/Cookies'),
+      claudeApp: '/usr/lib/claude-desktop',
+      pool: path.join(home, '.claude/projects'),
+      login: path.join(home, '.claude.json'),
+      backups: path.join(home, '.claude/backups'),
+      switchAccounts: path.join(home, '.claude-switch/accounts'),
+      state: path.join(config, 'claude-transplant')
+    }
+  }
   const support = path.join(home, 'Library/Application Support')
   return {
     home,
@@ -963,7 +1011,7 @@ function mode(values) {
 }
 
 const desktopLaunch = (paths, table) => {
-  const apps = table.filter(row => desktopExecutable(row.executable) || row.executable === path.join(paths.claudeApp, 'Contents/MacOS/Claude'))
+  const apps = table.filter(row => desktopExecutable(row.executable) || row.executable === appBinary(paths.claudeApp))
   const started = apps.length === 1 ? Date.parse(apps[0].started) : NaN
   return Number.isFinite(started) && started <= Date.now() ? { pid: apps[0].pid, started } : null
 }
@@ -1004,7 +1052,7 @@ export async function signedIn(paths, table = null) {
     if (table === null) {
       const result = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,lstart=,comm='], { encoding: 'utf8', timeout: 2000, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, LC_ALL: 'C' } })
       if (result.error || result.status !== 0) return unknown()
-      table = parseProcesses(result.stdout, '', paths.claudeApp)
+      table = parseProcesses(LINUX ? linuxExecutables(result.stdout) : result.stdout, '', paths.claudeApp)
     }
     const launch = desktopLaunch(paths, table)
     if (!launch) return unknown()
@@ -3318,7 +3366,7 @@ async function reconcile(paths, options = {}) {
       const running = () => { try { return Boolean(appProcess(paths, inspect())) } catch { return false } }
       if (!running()) {
         const deadline = now() + REOPEN_RESERVE
-        const opened = await (io.command ?? command)('/usr/bin/open', ['-g', '-a', paths.claudeApp], REOPEN_RESERVE)
+        const opened = await (io.command ?? command)(...openCommand(paths), REOPEN_RESERVE)
         restart.outcome = opened.status === 0 && await waitFor(running, deadline, now, io.wait) ? 'interrupted-reopened' : 'reopen-failed'
       } else restart.outcome = 'interrupted-app-running'
       restart.recoveredAt = new Date().toISOString()
